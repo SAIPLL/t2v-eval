@@ -1,0 +1,359 @@
+"""
+Data-similarity metric for T2V evaluation.
+
+Entry point: ``calculate_similarity_score(pred_log_dir, gt_log_dir, ...)``
+"""
+
+import os
+import json
+import math
+
+import numpy as np
+import scipy.optimize
+import scipy.spatial.distance
+from joblib import Parallel, delayed
+from tqdm import tqdm
+
+from .metric_utils import read_t2v_log_dir, summarize_fig_data, data_to_np_1d, data_to_np_4d
+
+
+# ---------------------------------------------------------------------------
+# Cost-matrix helpers
+# ---------------------------------------------------------------------------
+
+def create_dist_mat(seq1: list, seq2: list, compare) -> np.ndarray:
+    """Build a pairwise distance/cost matrix between two sequences."""
+    l1, l2 = len(seq1), len(seq2)
+    mat = np.full((l1, l2), -1.0)
+    for i in range(l1):
+        for j in range(l2):
+            mat[i, j] = compare(seq1[i], seq2[j])
+            assert not math.isnan(mat[i, j]), \
+                f"NaN in distance matrix at ({i}, {j})"
+    return mat
+
+
+def _pad_to_square(mat: np.ndarray) -> np.ndarray:
+    """Pad a rectangular cost matrix to square with cost 1.0."""
+    h, w = mat.shape
+    if h == w:
+        return mat
+    n = max(h, w)
+    padded = np.ones((n, n))
+    padded[:h, :w] = mat
+    return padded
+
+
+def get_score(cost_mat: np.ndarray) -> float:
+    """
+    Solve the linear assignment problem on *cost_mat* and return a similarity
+    score in [0, 1].
+
+    Uses ``scipy.optimize.linear_sum_assignment`` (Hungarian / Jonker-Volgenant).
+    """
+    cost_mat = _pad_to_square(cost_mat)
+    k = cost_mat.shape[0]
+    row_ind, col_ind = scipy.optimize.linear_sum_assignment(cost_mat)
+    avg_cost = cost_mat[row_ind, col_ind].sum() / k
+    return 1.0 - min(1.0, avg_cost)
+
+
+# ---------------------------------------------------------------------------
+# Per-series comparators
+# ---------------------------------------------------------------------------
+
+def compare_scatter(pred_ds: dict, gt_ds: dict,
+                    covar_epsilon: float = 1e-5,
+                    debug: bool = False) -> float:
+    """Compare two multi-dimensional scatter point clouds (Mahalanobis distance)."""
+    pred_np = data_to_np_4d(pred_ds)
+    gt_np   = data_to_np_4d(gt_ds)
+
+    if gt_np.shape[0] == 1:
+        if debug:
+            print("\t\tWarning: single GT point — falling back to Euclidean distance.")
+        cost_mat = np.minimum(
+            1.0, scipy.spatial.distance.cdist(pred_np, gt_np, metric="euclidean")
+        )
+    else:
+        V  = np.cov(gt_np.T) + np.eye(gt_np.shape[1]) * covar_epsilon
+        VI = np.linalg.inv(V).T
+        cost_mat = np.minimum(
+            1.0, scipy.spatial.distance.cdist(pred_np, gt_np, metric="mahalanobis", VI=VI)
+        )
+
+    # Replace any residual NaNs with maximum cost
+    cost_mat = np.where(np.isnan(cost_mat), 1.0, cost_mat)
+
+    score = get_score(cost_mat)
+    if debug:
+        print(f"\t\tScatter: pred={len(pred_ds['x'])} pts, gt={len(gt_ds['x'])} pts → {score:.4f}")
+    return score
+
+
+def get_cont_recall_new(p_xs, p_ys, g_xs, g_ys, epsilon: float) -> float:
+    """
+    Parametric (arc-length) interpolation recall for continuous (line) series.
+    """
+    p_ts = np.concatenate([[0], np.cumsum(np.hypot(np.diff(p_xs), np.diff(p_ys)))])
+    g_ts = np.concatenate([[0], np.cumsum(np.hypot(np.diff(g_xs), np.diff(g_ys)))])
+
+    if p_ts[-1] == 0: p_ts[-1] = epsilon
+    if g_ts[-1] == 0: g_ts[-1] = epsilon
+    p_ts /= p_ts[-1]
+    g_ts /= g_ts[-1]
+
+    interp_px = lambda t: np.interp(t, p_ts, p_xs)
+    interp_py = lambda t: np.interp(t, p_ts, p_ys)
+
+    total_score = total_interval = 0.0
+    n = len(g_ts)
+    for i in range(n):
+        if i == 0:
+            interval = (g_ts[1] - g_ts[0]) / 2
+        elif i == n - 1:
+            interval = (g_ts[-1] - g_ts[-2]) / 2
+        else:
+            interval = (g_ts[i + 1] - g_ts[i - 1]) / 2
+        interval = abs(interval)
+
+        gx, gy = g_xs[i], g_ys[i]
+        px, py = interp_px(g_ts[i]), interp_py(g_ts[i])
+        error  = np.hypot(gx - px, gy - py)
+        denom  = np.hypot(gx, gy) + epsilon
+        norm_error = min(1.0, error / denom)
+
+        total_score    += (1.0 - norm_error) * interval
+        total_interval += interval
+
+    return min(1.0, total_score / total_interval) if total_interval > 0 else 0.0
+
+def get_cont_recall(p_xs, p_ys, g_xs, g_ys, epsilon):
+    """
+    Use linear interpolation to estimate ground truth points on predicted curve to compute error
+    Then compute recall/precision based on the normalized error.
+    """
+    
+    total_score = 0
+    total_interval = 0
+    for i in range(g_xs.shape[0]):
+        x = g_xs[i]
+        if i == 0:
+            interval = (g_xs[i+1] - x) / 2
+        elif i == (g_xs.shape[0] - 1):
+            interval = (x - g_xs[i-1]) / 2
+        else:
+            interval = (g_xs[i+1] - g_xs[i-1]) / 2
+
+        y = g_ys[i]
+        y_interp = np.interp(x, p_xs, p_ys)
+        error = min(1, abs( (y - y_interp) / (abs(y) + epsilon)))
+        total_score += (1 - error) * interval
+        total_interval += interval
+    assert np.isclose(total_interval, g_xs[-1] - g_xs[0])
+    return min(1, total_score / total_interval) if total_interval > 0 else 0
+
+
+def compare_continuous(pred_ds: dict, gt_ds: dict, debug: bool = False) -> float:
+    """Compare two line-plot series using parametric recall/precision (F1)."""
+    p_xs, p_ys = pred_ds["x"], pred_ds["y"]
+    g_xs, g_ys = gt_ds["x"],  gt_ds["y"]
+
+    # If either curve is vertical, swap axes so interpolation works on x
+    if np.unique(p_xs).size == 1 or np.unique(g_xs).size == 1:
+        p_xs, p_ys = p_ys, p_xs
+        g_xs, g_ys = g_ys, g_xs
+
+    epsilon = (g_ys.max() - g_ys.min()) / 100 or 1e-5
+    recall    = get_cont_recall_new(p_xs, p_ys, g_xs, g_ys, epsilon)
+    precision = get_cont_recall_new(g_xs, g_ys, p_xs, p_ys, epsilon)
+    f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) else 0.0
+    f1 = max(0.0, min(1.0, f1))
+
+    if debug:
+        print(f"\t\tContinuous: pred={len(p_xs)} pts, gt={len(g_xs)} pts "
+              f"→ recall={recall:.4f}, precision={precision:.4f}, F1={f1:.4f}")
+    return f1
+
+
+def compare_discrete(pred_data: dict, gt_data: dict, debug: bool = False) -> float:
+    """Compare 1-D discrete (pie) series using Mahalanobis / Euclidean distance."""
+    pred_vals = data_to_np_1d(pred_data)
+    gt_vals   = data_to_np_1d(gt_data)
+
+    if len(gt_vals) == 1:
+        cost_mat = np.minimum(
+            1.0, scipy.spatial.distance.cdist(pred_vals, gt_vals, metric="euclidean")
+        )
+    else:
+        VI = 1.0 / np.cov(gt_vals.T)
+        cost_mat = np.minimum(
+            1.0, scipy.spatial.distance.cdist(pred_vals, gt_vals,
+                                               metric="mahalanobis", VI=VI)
+        )
+
+    score = get_score(cost_mat)
+    if debug:
+        print(f"\t\tDiscrete: pred={len(pred_vals)} pts, gt={len(gt_vals)} pts → {score:.4f}")
+    return score
+
+
+# ---------------------------------------------------------------------------
+# Axis / figure comparators
+# ---------------------------------------------------------------------------
+
+def compare_data_series(pred_series: dict, gt_series: dict, debug: bool = False) -> float:
+    """
+    Compare two series dicts produced by ``read_t2v_log_dir``.
+
+    Dispatches to the appropriate comparator based on ``plt_func``.
+    """
+    pred_func = pred_series["plt_func"]
+    gt_func   = gt_series["plt_func"]
+    pred_data = pred_series["data"]
+    gt_data   = gt_series["data"]
+
+    if pred_func == gt_func == "plot":
+        return compare_continuous(pred_data, gt_data, debug=debug)
+    if pred_func == gt_func == "pie":
+        return compare_discrete(pred_data, gt_data, debug=debug)
+    return compare_scatter(pred_data, gt_data, debug=debug)
+
+
+def compare_axes(pred_series_list: list, gt_series_list: list,
+                 debug: bool = False, n_jobs: int = 4) -> float:
+    """
+    Compare two axes by solving the optimal series-assignment problem.
+    """
+    n_pred = len(pred_series_list)
+    n_gt   = len(gt_series_list)
+
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(compare_data_series)(pred_series_list[i], gt_series_list[j], debug=debug)
+        for i in range(n_pred)
+        for j in range(n_gt)
+    )
+    score_matrix = np.array(results).reshape(n_pred, n_gt)
+    score_matrix = np.where(np.isnan(score_matrix), -1.0, score_matrix)
+
+    score = get_score(1.0 - score_matrix)
+    if debug:
+        print(f"\tAxes: pred={n_pred} series, gt={n_gt} series")
+        print(f"\tScore matrix:\n{score_matrix}")
+        print(f"\tFinal: {score:.4f}\n")
+    return score
+
+
+def compare_figures(pred_fig_data: dict, gt_fig_data: dict,
+                    debug: bool = False, n_jobs: int = 4) -> float:
+    """
+    Compare two full figures (dicts of axes) by optimal axis assignment.
+    """
+    pred_axes = list(pred_fig_data.values())
+    gt_axes   = list(gt_fig_data.values())
+    n_pred    = len(pred_axes)
+    n_gt      = len(gt_axes)
+
+    iterator = (
+        delayed(compare_axes)(pred_axes[i], gt_axes[j], debug=debug)
+        for i in range(n_pred)
+        for j in range(n_gt)
+    )
+    results = Parallel(n_jobs=n_jobs)(
+        tqdm(iterator, total=n_pred * n_gt,
+             desc="Computing score matrix", disable=not debug)
+    )
+    score_matrix = np.array(results).reshape(n_pred, n_gt)
+    score_matrix = np.where(np.isnan(score_matrix), -1.0, score_matrix)
+
+    score = get_score(1.0 - score_matrix)
+    if debug:
+        print(f"Figures: pred={n_pred} axes, gt={n_gt} axes")
+        print(f"Score matrix:\n{score_matrix}")
+        print(f"Final: {score:.4f}\n")
+    return score
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def calculate_similarity_score(pred_log_dir: str,
+                                gt_log_dir: str,
+                                down_sampling: bool = True,
+                                down_sampling_max_length: int = 10_000,
+                                down_sampling_method: str = "random",
+                                dedup: bool = False,
+                                summarize_before: bool = False,
+                                summarize_after: bool = False,
+                                print_points: int = 0,
+                                use_cache: bool = False,
+                                save_results: bool = False,
+                                verbose: bool = False) -> float:
+    """
+    Compute the data-similarity score between a predicted and a ground-truth
+    T2V log directory.
+
+    Parameters
+    ----------
+    pred_log_dir / gt_log_dir
+        Paths to log directories produced by ``activate_t2v_logging()``.
+    down_sampling
+        Randomly subsample long series before comparison.
+    down_sampling_max_length
+        Maximum number of points per series after downsampling.
+    down_sampling_method
+        Downsampling method — only ``"random"`` is supported.
+    dedup
+        Remove duplicate points (not yet implemented).
+    summarize_before / summarize_after
+        Print a data summary before / after preprocessing.
+    use_cache
+        Return cached result from ``evaluation.json`` if it exists.
+    save_results
+        Write the result to ``evaluation.json`` in ``pred_log_dir``.
+    verbose
+        Print debug information during scoring.
+
+    Returns
+    -------
+    float  Similarity score in [0, 1].
+    """
+    eval_path = os.path.join(pred_log_dir, "evaluation.json")
+    if use_cache and os.path.exists(eval_path):
+        with open(eval_path, encoding="utf-8") as fh:
+            return json.load(fh)["similarity_score"]
+
+    _kwargs = dict(
+        dedup=dedup,
+        down_sampling=down_sampling,
+        down_sampling_max_length=down_sampling_max_length,
+        down_sampling_method=down_sampling_method,
+        verbose=verbose,
+        summarize_before=summarize_before,
+        summarize_after=summarize_after,
+        print_points=print_points,
+    )
+    pred_fig_data = read_t2v_log_dir(pred_log_dir, **_kwargs)
+    gt_fig_data   = read_t2v_log_dir(gt_log_dir,   **_kwargs)
+
+    if verbose:
+        gt_n   = sum(len(v) for v in gt_fig_data.values())
+        pred_n = sum(len(v) for v in pred_fig_data.values())
+        if gt_n * pred_n > 10:
+            print(f"GT series: {gt_n}, Pred series: {pred_n} — may take a while …")
+
+    similarity_score = compare_figures(pred_fig_data, gt_fig_data, debug=verbose)
+
+    if save_results:
+        result = {
+            "pred_log_dir":    pred_log_dir,
+            "pred_summary":    summarize_fig_data(pred_fig_data, data_type="Prediction", verbose=False),
+            "gt_log_dir":      gt_log_dir,
+            "gt_summary":      summarize_fig_data(gt_fig_data,   data_type="Ground Truth", verbose=False),
+            "similarity_score": similarity_score,
+        }
+        with open(eval_path, "w", encoding="utf-8") as fh:
+            json.dump(result, fh, indent=4)
+
+    return similarity_score
