@@ -264,18 +264,6 @@ pytest tests/t2v_logging/test_geopandas.py            -v
 
 ---
 
-## Docker build
-
-```bash
-docker buildx build \
-  --platform linux/amd64 \
-  -t your-image-name:tag \
-  --push \
-  .
-```
-
----
-
 ## License
 
 See [LICENSE](LICENSE).
