@@ -8,7 +8,7 @@ include = ["t2v_eval*"]
 
 [project]
 name = "t2v_eval"
-version = "0.2.0"
+version = "0.2.1"
 description = "Evalulation scripts for Text-to-Vis projects"
 readme = "README.md"
 requires-python = ">=3.10, <=3.12.13"
