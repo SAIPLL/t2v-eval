@@ -53,7 +53,6 @@ Example
 """
 
 import copy
-import glob
 import json
 import math
 import os
@@ -410,6 +409,10 @@ def is_color_bar_log(log_data: dict) -> bool:
 # Log-file name prefixes that are metadata, not data series
 _RESERVED_LOG_PREFIXES = ("variables", "evaluation", "execution")
 
+# Compacted log format — one record per line. Produced by
+# t2v_eval.logging.compact_log_dir.
+_SERIES_JSONL_NAME = "series.jsonl"
+
 
 def _parse_series(plt_func: str, series: dict, json_file: str) -> dict | None:
     """
@@ -512,14 +515,66 @@ def _parse_series(plt_func: str, series: dict, json_file: str) -> dict | None:
     raise ValueError(f"Unsupported plt_func: {plt_func!r}")
 
 
+def _ingest_record(json_data: dict,
+                   axis_id: str,
+                   plot_func_id: str,
+                   source_label: str,
+                   fig_data: defaultdict,
+                   verbose: bool) -> bool:
+    """
+    Add the parsed series of one log record into *fig_data*.
+
+    Returns True iff this record contained at least one geo series.
+    """
+    if is_color_bar_log(json_data):
+        return False
+
+    is_geo = False
+    plt_func = json_data["plt_func"]
+    for series in json_data.get("data_series", []):
+        data = _parse_series(plt_func, series, source_label)
+        if data is None:
+            continue
+
+        # linestyle-less plot → reclassify as scatter
+        actual_plt_func = plt_func
+        if plt_func == "plot" and str(series.get("linestyle", "None")) == "None":
+            actual_plt_func = "scatter"
+            data["z"] = np.full(len(data["x"]), 5, dtype=float)
+            if verbose:
+                print(f"Warning: {source_label} has a plot with no linestyle, "
+                      f"treating it as scatter plot.")
+
+        if actual_plt_func == "geo":
+            is_geo = True
+
+        fig_data[axis_id].append({
+            "plt_func":     actual_plt_func,
+            "data":         data,
+            "name":         series.get("name", ""),
+            "plot_func_id": plot_func_id,
+        })
+
+    return is_geo
+
+
 def parse_t2v_log_dir(log_dir: str, verbose: bool = False) -> dict:
     """
     Parse a T2V log directory and return per-axis series data.
 
+    Only the **compacted** log format is supported: ``<log_dir>/series.jsonl``
+    must exist, with one JSON record per line, each carrying ``axis_id`` and
+    ``plot_func_id`` fields. This is the format produced by
+    :func:`t2v_eval.logging.compact_log_dir`.
+
+    The legacy "loose" layout (many ``<fig_id>_<ax_id>_<ts>.json`` files in
+    the directory) is no longer accepted. Use ``compact_log_dir`` to convert
+    pre-existing log directories before scoring.
+
     Parameters
     ----------
     log_dir : str
-        Path to the log directory produced by ``activate_t2v_logging()``.
+        Path to the log directory produced by ``compact_log_dir``.
     verbose : bool
         Print a warning when a linestyle-less ``plot`` series is re-classified
         as ``scatter``.
@@ -528,45 +583,36 @@ def parse_t2v_log_dir(log_dir: str, verbose: bool = False) -> dict:
     -------
     defaultdict
         ``{axis_id: [series_dict, …]}`` — see module docstring for the schema.
+
+    Raises
+    ------
+    FileNotFoundError
+        If ``<log_dir>/series.jsonl`` is missing.
     """
     fig_data: defaultdict = defaultdict(list)
     is_having_geo_plot = False
-    for json_file in sorted(glob.glob(os.path.join(log_dir, "*.json"))):
-        stem = os.path.basename(json_file).rsplit(".", maxsplit=1)[0]
-        if stem.startswith(_RESERVED_LOG_PREFIXES):
-            continue
 
-        axis_id, plot_func_id = stem.rsplit("_", 1)
-        with open(json_file, encoding="utf-8") as fh:
-            json_data = json.load(fh)
+    jsonl_path = os.path.join(log_dir, _SERIES_JSONL_NAME)
+    if not os.path.isfile(jsonl_path):
+        raise FileNotFoundError(
+            f"series.jsonl not found in {log_dir!r}. "
+            f"This loader only supports the compacted JSONL layout — run "
+            f"t2v_eval.logging.compact_log_dir() to convert legacy log "
+            f"directories."
+        )
 
-        if is_color_bar_log(json_data):
-            continue
-        
-        plt_func = json_data["plt_func"]
-        for series in json_data.get("data_series", []):
-            data = _parse_series(plt_func, series, json_file)
-            if data is None:
+    with open(jsonl_path, encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, start=1):
+            line = line.strip()
+            if not line:
                 continue
-
-            # linestyle-less plot → reclassify as scatter
-            actual_plt_func = plt_func
-            if plt_func == "plot" and str(series.get("linestyle", "None")) == "None":
-                actual_plt_func = "scatter"
-                data["z"] = np.full(len(data["x"]), 5, dtype=float)
-                if verbose:
-                    print(f"Warning: {json_file} has a plot with no linestyle, "
-                          f"treating it as scatter plot.")
-            
-            if actual_plt_func == "geo":
+            json_data = json.loads(line)
+            axis_id      = json_data.get("axis_id", "")
+            plot_func_id = json_data.get("plot_func_id", "")
+            source_label = f"{jsonl_path}:{lineno}"
+            if _ingest_record(json_data, axis_id, plot_func_id,
+                              source_label, fig_data, verbose):
                 is_having_geo_plot = True
-            
-            fig_data[axis_id].append({
-                "plt_func":     actual_plt_func,
-                "data":         data,
-                "name":         series.get("name", ""),
-                "plot_func_id": plot_func_id,
-            })
 
     if is_having_geo_plot:
         fig_data = handle_nan_vals_in_geo_plots(fig_data, verbose=verbose)
