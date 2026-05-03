@@ -595,10 +595,10 @@ def parse_t2v_log_dir(log_dir: str, verbose: bool = False) -> dict:
     jsonl_path = os.path.join(log_dir, _SERIES_JSONL_NAME)
     if not os.path.isfile(jsonl_path):
         raise FileNotFoundError(
-            f"series.jsonl not found in {log_dir!r}. "
+            f"series.jsonl not found in {log_dir!r}. Maybe the program did not produce any charts? Or maybe the log directory is in the old format? "
             f"This loader only supports the compacted JSONL layout — run "
             f"t2v_eval.logging.compact_log_dir() to convert legacy log "
-            f"directories."
+            f"directories if you used the old logging format."
         )
 
     with open(jsonl_path, encoding="utf-8") as fh:

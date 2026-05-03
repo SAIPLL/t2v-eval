@@ -2,7 +2,17 @@ import os
 import subprocess
 from enum import Enum
 
-from .utils import LOG_DIR, reset_log_dir, setup_log_dir, set_variable, get_variable, log_data
+from .utils import (
+    LOG_DIR,
+    reset_log_dir,
+    setup_log_dir,
+    set_variable,
+    get_variable,
+    log_data,
+    compact_log_dir,
+    iter_series_records,
+    SERIES_JSONL_NAME,
+)
 from .matplotlib_logging import activate_matplotlib_logging
 from .seaborn_logging import activate_seaborn_logging
 from .geopandas_logging import activate_geopandas_logging
@@ -14,6 +24,9 @@ __all__ = [
     "set_variable",
     "get_variable",
     "log_data",
+    "compact_log_dir",
+    "iter_series_records",
+    "SERIES_JSONL_NAME",
     "activate_matplotlib_logging",
     "activate_seaborn_logging",
     "activate_geopandas_logging",

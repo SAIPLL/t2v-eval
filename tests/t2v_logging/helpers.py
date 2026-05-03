@@ -34,6 +34,9 @@ import numpy as np
 # Log files with these name prefixes are metadata, not data series
 _RESERVED_PREFIXES = ("variables", "evaluation", "execution")
 
+# Filename of the compact JSONL produced by ``log_data`` / ``compact_log_dir``
+_SERIES_JSONL_NAME = "series.jsonl"
+
 # Coordinate keys checked for length consistency and value accuracy
 _COORD_KEYS = ("x", "y", "z", "s", "t")
 
@@ -44,7 +47,13 @@ _COORD_KEYS = ("x", "y", "z", "s", "t")
 
 def read_log_series(log_dir: str, plt_func: str = None) -> list:
     """
-    Read all data-series from every JSON log file in *log_dir*.
+    Read all data-series logged for *log_dir*.
+
+    The reader prefers the compact ``series.jsonl`` format (one record per
+    line) produced by the current ``log_data``.  If that file is absent it
+    falls back to the legacy layout where each plotting call writes its own
+    ``<fig_id>_<ax_id>_<ts>.json`` file — this keeps any pre-existing golden
+    log directories working without modification.
 
     Parameters
     ----------
@@ -57,21 +66,50 @@ def read_log_series(log_dir: str, plt_func: str = None) -> list:
     -------
     list of dict
         Flat list of series dicts, each augmented with a ``"plt_func"`` key
-        taken from the parent log file.
+        taken from the parent log record.
     """
+    log_dir = str(log_dir)
+    jsonl_path = os.path.join(log_dir, _SERIES_JSONL_NAME)
+
+    if os.path.isfile(jsonl_path):
+        records = _iter_jsonl_records(jsonl_path)
+    else:
+        records = _iter_loose_json_records(log_dir)
+
     series = []
-    for path in sorted(glob.glob(os.path.join(str(log_dir), "*.json"))):
+    for record in records:
+        func = record.get("plt_func", "")
+        if plt_func is not None and func != plt_func:
+            continue
+        for s in record.get("data_series", []):
+            series.append({"plt_func": func, **s})
+    return series
+
+
+def _iter_jsonl_records(jsonl_path: str):
+    """Yield log records from the compact ``series.jsonl`` format."""
+    with open(jsonl_path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            yield json.loads(line)
+
+
+def _iter_loose_json_records(log_dir: str):
+    """
+    Yield log records from the legacy per-call JSON layout.
+
+    Each ``<fig_id>_<ax_id>_<ts>.json`` file produced by older versions of
+    ``log_data`` becomes a single record.  Reserved metadata files
+    (``variables.json``, etc.) are skipped.
+    """
+    for path in sorted(glob.glob(os.path.join(log_dir, "*.json"))):
         stem = os.path.basename(path).rsplit(".", 1)[0]
         if stem.startswith(_RESERVED_PREFIXES):
             continue
         with open(path, encoding="utf-8") as fh:
-            log = json.load(fh)
-        func = log.get("plt_func", "")
-        if plt_func is not None and func != plt_func:
-            continue
-        for s in log.get("data_series", []):
-            series.append({"plt_func": func, **s})
-    return series
+            yield json.load(fh)
 
 
 def load_golden(golden_dir) -> list:

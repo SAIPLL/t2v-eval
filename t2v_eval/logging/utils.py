@@ -55,6 +55,145 @@ def setup_log_dir(log_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Log compaction (per-series JSONs → single series.jsonl)
+# ---------------------------------------------------------------------------
+
+# Filename prefixes that are metadata, not data series. Kept consistent with
+# the reader's _RESERVED_LOG_PREFIXES.
+_RESERVED_LOG_PREFIXES = ("variables", "evaluation", "execution")
+SERIES_JSONL_NAME = "series.jsonl"
+
+
+def compact_log_dir(log_dir: str, remove_loose: bool = True) -> str | None:
+    """
+    Compact a log directory's per-series ``*.json`` files into a single
+    ``series.jsonl`` (one JSON record per line).
+
+    Each loose file ``<fig_id>_<ax_id>_<ts>.json`` becomes one JSONL record::
+
+        {"axis_id": "<fig_id>_<ax_id>",
+         "plot_func_id": "<ts>",
+         "t2v_eval_version": "...",
+         "plt_func": "...",
+         "args": [...],
+         "kargs": {...},
+         "data_series": [...]}
+
+    The ``axis_id`` / ``plot_func_id`` fields preserve the information that
+    used to live in the filename, so the reader can reconstruct exactly the
+    same per-axis structure without globbing thousands of small files.
+
+    Behaviour
+    ---------
+    * Idempotent: if ``series.jsonl`` already exists, the function is a no-op
+      and returns its path.
+    * Atomic write: data is written to ``series.jsonl.tmp`` first and renamed,
+      so a crash mid-compaction never produces a corrupt JSONL.
+    * Reserved files (``variables.json``, ``evaluation.json``, ``execution.json``)
+      and dotfiles are left in place.
+    * When ``remove_loose=True`` (the default), the original per-series JSONs
+      are deleted only after the JSONL is successfully renamed into place.
+
+    Parameters
+    ----------
+    log_dir : str
+        Path to a log directory produced by ``activate_t2v_logging()``.
+    remove_loose : bool
+        Delete the per-series ``*.json`` files after a successful compaction.
+
+    Returns
+    -------
+    str or None
+        The path to ``series.jsonl`` if compaction ran or already existed;
+        ``None`` if *log_dir* doesn't exist or has no per-series files.
+    """
+    if not os.path.isdir(log_dir):
+        return None
+
+    jsonl_path = os.path.join(log_dir, SERIES_JSONL_NAME)
+    if os.path.isfile(jsonl_path):
+        return jsonl_path
+
+    # Discover per-series files and load them in stable order so the resulting
+    # JSONL is deterministic.
+    series_files: list[str] = []
+    for name in sorted(os.listdir(log_dir)):
+        if not name.endswith(".json"):
+            continue
+        if name.startswith(".") or name.startswith("_"):
+            continue
+        if name.rsplit(".", 1)[0].startswith(_RESERVED_LOG_PREFIXES):
+            continue
+        series_files.append(os.path.join(log_dir, name))
+
+    if not series_files:
+        return None
+
+    tmp_path = jsonl_path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as out_fh:
+            for path in series_files:
+                stem = os.path.basename(path).rsplit(".", 1)[0]
+                # Filename format from log_data(): "<fig_id>_<ax_id>_<ts>"
+                # The reader splits the LAST underscore: axis_id="<fig_id>_<ax_id>",
+                # plot_func_id="<ts>".
+                if "_" in stem:
+                    axis_id, plot_func_id = stem.rsplit("_", 1)
+                else:
+                    axis_id, plot_func_id = stem, ""
+
+                with open(path, encoding="utf-8") as in_fh:
+                    record = json.load(in_fh)
+
+                record["axis_id"]      = axis_id
+                record["plot_func_id"] = plot_func_id
+
+                # ensure_ascii=False keeps non-ASCII labels readable; one line
+                # per record means line-by-line parsing is safe.
+                out_fh.write(json.dumps(record, ensure_ascii=False))
+                out_fh.write("\n")
+
+        os.replace(tmp_path, jsonl_path)
+    except BaseException:
+        # Don't leave a half-written .tmp behind on error.
+        if os.path.isfile(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
+
+    if remove_loose:
+        for path in series_files:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    return jsonl_path
+
+
+def iter_series_records(log_dir: str):
+    """
+    Yield raw log records from a compacted ``series.jsonl``.
+
+    This is a small helper for callers that only need to stream over the
+    records (e.g. analytics scripts). The metric readers in
+    ``t2v_eval.evaluation`` use a slightly different code path because they
+    also want the legacy filename-derived fields when JSONL isn't present.
+    """
+    jsonl_path = os.path.join(log_dir, SERIES_JSONL_NAME)
+    if not os.path.isfile(jsonl_path):
+        return
+    with open(jsonl_path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            yield json.loads(line)
+
+
+# ---------------------------------------------------------------------------
 # Simple JSON-backed flag store
 # ---------------------------------------------------------------------------
 
@@ -193,7 +332,23 @@ def is_datetime_line(x_data: list) -> bool:
 
 def log_data(ax, plt_func: str, args, kargs: dict, data_series: list) -> None:
     """
-    Serialise one plotting call to a timestamped JSON file in ``LOG_DIR``.
+    Append one plotting call as a single compact JSON record to
+    ``series.jsonl`` in ``LOG_DIR``.
+
+    Each call writes exactly one line to the shared ``series.jsonl`` file,
+    matching the record shape produced by :func:`compact_log_dir`::
+
+        {"axis_id": "<fig_id>_<ax_id>",
+         "plot_func_id": "<ts>",
+         "t2v_eval_version": "...",
+         "plt_func": "...",
+         "args": [...],
+         "kargs": {...},
+         "data_series": [...]}
+
+    The record is dumped without indentation so it occupies a single line,
+    making the file safe to read with line-by-line JSONL parsers (e.g.
+    :func:`iter_series_records`).
 
     Parameters
     ----------
@@ -211,7 +366,7 @@ def log_data(ax, plt_func: str, args, kargs: dict, data_series: list) -> None:
     ax_id   = id(ax)
     fig_id  = id(ax.figure)
     ts      = str(time.time()).replace(".", "")
-    out     = os.path.join(LOG_DIR, f"{fig_id}_{ax_id}_{ts}.json")
+    axis_id = f"{fig_id}_{ax_id}"
 
     save_kargs = kargs.copy()
     try:
@@ -227,26 +382,35 @@ def log_data(ax, plt_func: str, args, kargs: dict, data_series: list) -> None:
         for key in list(series.keys()):
             try:
                 json.dumps(series[key], cls=JSONNumberEncoder,
-                           indent=4, ensure_ascii=False)
+                           ensure_ascii=False)
             except Exception:
                 assert key not in ("x", "y", "z", "V", "labels"), \
                     f"Critical key {key!r} failed JSON serialisation."
                 series[key] = None
 
-    with open(out, "w", encoding="utf-8") as fh:
-        json.dump(
-            {
-                "t2v_eval_version": T2V_EVAL_VERSION,
-                "plt_func":         plt_func,
-                "args":             args,
-                "kargs":            save_kargs,
-                "data_series":      data_series,
-            },
-            fh,
-            indent=4,
-            ensure_ascii=False,
-            cls=JSONNumberEncoder,
-        )
+    record = {
+        "axis_id":          axis_id,
+        "plot_func_id":     ts,
+        "t2v_eval_version": T2V_EVAL_VERSION,
+        "plt_func":         plt_func,
+        "args":             args,
+        "kargs":            save_kargs,
+        "data_series":      data_series,
+    }
+
+    line = json.dumps(
+        record,
+        ensure_ascii=False,
+        cls=JSONNumberEncoder,
+    )
+
+    out_path = os.path.join(LOG_DIR, SERIES_JSONL_NAME)
+    # Append-mode + a single write of "<line>\n" keeps each record on its own
+    # line. Using one ``write`` call (rather than ``writelines`` or two
+    # separate calls) makes interleaving with concurrent writers less likely
+    # on typical POSIX filesystems.
+    with open(out_path, "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
 
 
 # ---------------------------------------------------------------------------
